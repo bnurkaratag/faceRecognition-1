@@ -1,0 +1,142 @@
+import cv2
+import pickle
+import time
+import sys
+import os
+from gpiozero import Servo
+
+# Qt/Wayland hatasını çöz
+os.environ["QT_QPA_PLATFORM"] = "xcb"
+
+# Servo motor ayarları
+servo = Servo(17, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000)
+print("Servo motor başarıyla başlatıldı!")
+
+def unlock_door():
+    try:
+        print("Kapı açılıyor...")
+        servo.max()  # Kapıyı aç (180 derece)
+        time.sleep(3)
+        
+        print("Kapı kapanıyor...")
+        servo.min()  # Kapıyı kapat (0 derece)
+        time.sleep(1)
+    except Exception as e:
+        print(f"Kilit mekanizması hatası: {str(e)}")
+
+# Yüz tanıyıcı ve cascade sınıflandırıcı
+recognizer = cv2.face.LBPHFaceRecognizer_create()
+try:
+    recognizer.read('trainer.yml')
+except:
+    print("trainer.yml dosyasi bulunamadi! Once modeli egittiginizden emin olun.")
+    sys.exit(1)
+
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Etiketleri yükle
+try:
+    with open('labels.pkl', 'rb') as f:
+        label_dict = pickle.load(f)
+except:
+    print("labels.pkl dosyasi bulunamadi! Once modeli egittiginizden emin olun.")
+    sys.exit(1)
+
+# Kamera başlat
+print("Kamera baslatiliyor...")
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Kamera acilamadi!")
+    sys.exit(1)
+
+cap.set(3, 640)
+cap.set(4, 480)
+print("Sistem hazir! Cikmak icin 'q' tusuna basin.")
+
+last_unlock_time = 0  # Son kapı açılma zamanı
+recognition_counter = 0  # Ardışık tanıma sayacı
+RECOGNITION_THRESHOLD = 3  # Kaç kez ardışık tanınması gerektiği
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Goruntu alinamiyor!")
+            break
+            
+        # Görüntüyü ayna gibi çevir
+        frame = cv2.flip(frame, 1)
+        
+        # Bilgi paneli oluştur
+        info_panel = frame.copy()
+        cv2.rectangle(info_panel, (0, 0), (frame.shape[1], 40), (0, 0, 0), -1)
+        cv2.putText(info_panel, "Yuz Tanima Sistemi - Cikmak icin 'q' tusuna basin", 
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        frame = info_panel
+        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(30, 30))
+        
+        current_time = time.time()
+        face_recognized = False
+        
+        for (x, y, w, h) in faces:
+            roi_gray = gray[y:y+h, x:x+w]
+            roi_gray = cv2.resize(roi_gray, (100, 100))
+            
+            try:
+                # Yüz tanıma
+                label, confidence = recognizer.predict(roi_gray)
+                
+                # Confidence değeri 0-100 arasında, düşük değer daha iyi eşleşme demek
+                if confidence < 85:  # Eşik değeri
+                    name = label_dict[label]
+                    match_text = f"Eslesme: {100-confidence:.1f}%"
+                    color = (0, 255, 0)  # Yeşil
+                    face_recognized = True
+                    
+                    # Ardışık tanıma sayacını artır
+                    recognition_counter += 1
+                    
+                    # Yeterli sayıda ardışık tanıma ve zaman aralığı kontrolü
+                    if recognition_counter >= RECOGNITION_THRESHOLD and current_time - last_unlock_time > 5:
+                        print(f"Hos geldin {name}! (Guven: {100-confidence:.1f}%)")
+                        unlock_door()
+                        last_unlock_time = current_time
+                        recognition_counter = 0  # Sayacı sıfırla
+                else:
+                    name = "Bilinmiyor"
+                    match_text = f"Eslesme: {100-confidence:.1f}%"
+                    color = (0, 0, 255)  # Kırmızı
+                    recognition_counter = 0  # Tanınmadığında sayacı sıfırla
+                
+                # Çerçeve ve bilgi metinleri
+                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                cv2.rectangle(frame, (x, y-60), (x+w, y), color, -1)
+                cv2.putText(frame, name, (x+5, y-35),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(frame, match_text, (x+5, y-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+            except Exception as e:
+                print(f"Tanima hatasi: {str(e)}")
+                recognition_counter = 0
+        
+        # Yüz tanınmadıysa sayacı sıfırla
+        if not face_recognized:
+            recognition_counter = 0
+        
+        # Çıkış tuşu (q) kontrolü
+        cv2.imshow('Yuz Tanima Sistemi', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    print("\nProgram kullanici tarafindan sonlandirildi.")
+except Exception as e:
+    print(f"Beklenmeyen hata: {str(e)}")
+finally:
+    print("\nSistem kapatiliyor...")
+    servo.detach()  # Servo motoru kapat
+    cap.release()
+    cv2.destroyAllWindows()
